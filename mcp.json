@@ -1,0 +1,15 @@
+{
+    "servers": {
+        "calibre_mcp_server": {
+            "type": "stdio",
+            "command": "python",
+            "args": [
+                "-m",
+                "calibre_mcp_server"
+            ],
+            "env": {
+                "CALIBRE_LIBRARY_PATH:": "YOUR_CALIBRE_LIBRARY_PATH"
+            }
+        }
+    }
+}
