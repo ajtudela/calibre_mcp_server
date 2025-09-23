@@ -1,4 +1,6 @@
 # Calibre MCP Server
+![License](https://img.shields.io/github/license/ajtudela/calibre_mcp_server)
+
 
 An MCP (Model Context Protocol) server that provides tools to interact with a Calibre e-book library, allowing search and retrieval of book metadata through the MCP protocol.
 
@@ -21,6 +23,18 @@ An MCP (Model Context Protocol) server that provides tools to interact with a Ca
 | ---------------------- | ------- | --------------------------------------------------------------------------- |
 | `CALIBRE_LIBRARY_PATH` | —       | Required path to Calibre library (mandatory, if missing server won't start) |
 
+### Environment Configuration
+Copy the example environment file and configure your settings:
+
+```bash
+cp .env.example .env
+```
+
+Edit the `.env` file and set your Calibre library path:
+```bash
+CALIBRE_LIBRARY_PATH=/path/to/your/calibre/library
+```
+
 ## Features
 - **Search capabilities**: Search books by title, author, series, and tags with wildcard support
 - **Comprehensive metadata**: Retrieve complete book information including publication dates, series info, and tags
@@ -29,32 +43,99 @@ An MCP (Model Context Protocol) server that provides tools to interact with a Ca
 - **Author discovery**: Find authors and explore their complete bibliographies
 - **Series tracking**: Access books in series with proper ordering by series index
 
+## Installation
+
+### Install with uv (recommended)
+
+Clone the repository and install with uv:
+
+```bash
+git clone https://github.com/ajtudela/calibre_mcp_server.git
+cd calibre_mcp_server
+cp .env.example .env
+# Edit .env file with your Calibre library path
+uv sync
+```
+
+Or install directly from the repository:
+
+```bash
+uv add git+https://github.com/ajtudela/calibre_mcp_server.git
+```
+
+### Install with pip
+
+Install the package in mode:
+
+```bash
+git clone https://github.com/ajtudela/calibre_mcp_server.git
+cd calibre_mcp_server
+cp .env.example .env
+# Edit .env file with your Calibre library path
+python3 -m pip install .
+```
+
+Or install directly from the repository:
+
+```bash
+python3 -m pip install git+https://github.com/ajtudela/calibre_mcp_server.git
+```
 
 ## Usage
 
-### Install as local package
-Install the package:
+### Running with uv
 
 ```bash
-python -m pip install .
+uv run calibre_mcp_server
 ```
 
-#### Configuration example for Claude Desktop/Cursor/VSCode
+### Running with pip installation
+
+```bash
+python3 -m calibre_mcp_server
+```
+
+### Configuration example for Claude Desktop/Cursor/VSCode
+
+#### Using uv (recommended)
+
 Add this configuration to your application's settings (mcp.json):
+
 ```json
-"calibre mcp server": {
+{
+  "calibre mcp server": {
     "type": "stdio",
-    "command": "python",
+    "command": "uv",
     "args": [
-        "-m",
-        "calibre_mcp_server"
+      "run",
+      "--directory",
+      "/path/to/calibre_mcp_server",
+      "calibre_mcp_server"
     ],
     "env": {
-        "CALIBRE_LIBRARY_PATH": "C:\\Users\\YourUser\\Calibre Library"
+        "CALIBRE_LIBRARY_PATH": "YOUR_CALIBRE_LIBRARY_PATH"
     }
+  }
 }
 ```
 
+#### Using pip installation
+
+```json
+{
+  "calibre mcp server": {
+    "type": "stdio",
+    "command": "python3",
+    "args": [
+      "-m",
+      "calibre_mcp_server"
+    ],
+    "env": {
+        "CALIBRE_LIBRARY_PATH": "YOUR_CALIBRE_LIBRARY_PATH"
+    }
+  }
+}
+```
 
 ## Technical Notes
 - Connection to Calibre database is performed automatically when the server starts.

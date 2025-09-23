@@ -8,7 +8,7 @@
                 "calibre_mcp_server"
             ],
             "env": {
-                "CALIBRE_LIBRARY_PATH:": "YOUR_CALIBRE_LIBRARY_PATH"
+                "CALIBRE_LIBRARY_PATH:": "/path/to/your/calibre/library"
             }
         }
     }

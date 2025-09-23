@@ -21,25 +21,7 @@ classifiers = [
 ]
 
 [project.scripts]
-calibre_mcp_server = "calibre_mcp_server.__main__:main"
+calibre_mcp_server = "calibre_mcp_server.server:main"
 
-[tool.mypy]
-python_version = "3.12"
-warn_unused_configs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_return_any = true
-warn_unreachable = true
-strict_equality = true
-check_untyped_defs = true
-disallow_incomplete_defs = true
-disallow_untyped_defs = true
-no_implicit_optional = true
-show_error_codes = true
-
-[[tool.mypy.overrides]]
-module = [
-  "fastmcp.*"
-]
-ignore_missing_imports = true
-
+[tool.uv]
+package = true
