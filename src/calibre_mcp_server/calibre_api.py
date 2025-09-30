@@ -1,8 +1,26 @@
+"""
+Calibre API module for database interactions.
+
+This module provides classes and functions for interacting with Calibre's
+SQLite database, including book metadata retrieval and search operations.
+"""
 
 import os
 import sqlite3
-from typing import List, Tuple, Generator
+import logging
+from typing import List, Tuple, Generator, Dict, Any, Optional
 from contextlib import contextmanager
+from pathlib import Path
+
+from .exceptions import (
+    DatabaseError,
+    NotFoundError,
+    ConfigurationError
+)
+from .validation import validate_positive_integer, validate_search_parameters
+
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -10,25 +28,41 @@ def database_connection(
     db_path: str
 ) -> Generator[sqlite3.Connection, None, None]:
     """
-    Context manager for SQLite database connections.
+    Context manager for SQLite database connections with error handling.
 
-    Args:
-        db_path (str): Path to the SQLite database file.
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite database file.
 
-    Yields:
-        sqlite3.Connection: Database connection object.
+    Yields
+    ------
+    sqlite3.Connection
+        Database connection object.
 
-    Raises:
-        sqlite3.Error: If there is a database connection error.
+    Raises
+    ------
+    DatabaseError
+        If there is a database connection error.
     """
+    if not Path(db_path).exists():
+        raise DatabaseError(
+            f'Database file not found: {db_path}',
+            'connection'
+        )
+
     conn = None
     try:
         conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row  # Enable column access by name
         yield conn
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        raise e
+        raise DatabaseError(
+            f'Database connection failed: {e}',
+            'connection'
+        )
     finally:
         if conn:
             conn.close()
@@ -37,32 +71,50 @@ def database_connection(
 class Book:
     """
     Represents a book with its metadata from the Calibre database.
+
+    This class loads and manages all metadata for a single book,
+    providing a clean interface for accessing book information.
     """
 
     def __init__(
         self,
-        id: int,
+        book_id: int,
         library_path: str,
         db_filename: str = 'metadata.db'
-    ):
+    ) -> None:
         """
-        Initialize a Book instance with the path to the Calibre library and
-        database filename.
+        Initialize a Book instance with metadata from Calibre database.
 
-        Args:
-            id (int): Book ID.
-            library_path (str): Path to the Calibre library folder.
-            db_filename (str): Name of the SQLite database file
-                (default: 'metadata.db').
+        Parameters
+        ----------
+        book_id : int
+            Book ID (must be positive).
+        library_path : str
+            Path to the Calibre library folder.
+        db_filename : str, optional
+            Name of the SQLite database file, by default 'metadata.db'.
 
-        Raises:
-            ValueError: If the book ID is not found in the database.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If book_id is not a positive integer.
+        ConfigurationError
+            If library_path is invalid.
+        DatabaseError
+            If database file is not found or there's a connection error.
+        NotFoundError
+            If the book ID is not found in the database.
         """
-        if not isinstance(id, int) or id <= 0:
-            raise ValueError("Book ID must be a positive integer")
+        # Validate inputs
+        self.id = validate_positive_integer(book_id, 'book_id')
 
-        self.id = id
+        if not library_path or not isinstance(library_path, str):
+            raise ConfigurationError(
+                'Library path must be a non-empty string',
+                'library_path'
+            )
+
+        # Initialize attributes with default values
         self.title = ''
         self.title_sort = ''
         self.date = ''
@@ -77,31 +129,32 @@ class Book:
         self.synopsis = ''
         self.tags = ''
 
-        if not library_path or not isinstance(library_path, str):
-            raise ValueError("Library path must be a non-empty string")
-
+        # Set up database path
         self.db_path = os.path.join(library_path, db_filename)
-        if not os.path.exists(self.db_path):
-            raise FileNotFoundError(f"Database file not found: {self.db_path}")
-        self._load_book_data(self.db_path)
 
-    def _load_book_data(self, db_path: str) -> None:
+        # Load book data
+        self._load_book_data()
+
+    def _load_book_data(self) -> None:
         """
         Load all book data from the database in a single optimized query.
 
-        Args:
-            db_path (str): Path to the SQLite database file.
+        This method performs a comprehensive join to retrieve all book
+        metadata in one database operation for better performance.
 
-        Raises:
-            ValueError: If the book ID is not found.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        DatabaseError
+            If there's a database error during data loading.
+        NotFoundError
+            If the book ID is not found in the database.
         """
         try:
-            with database_connection(db_path) as conn:
+            with database_connection(self.db_path) as conn:
                 cursor = conn.cursor()
 
-                # Single comprehensive query to get all book data at once
-                cursor.execute("""
+                # Comprehensive query to get all book data at once
+                query = """
                     SELECT
                         b.title,
                         b.sort,
@@ -123,7 +176,7 @@ class Book:
                     FROM books b
                     LEFT JOIN books_authors_link bal ON b.id = bal.book
                     LEFT JOIN authors a ON bal.author = a.id
-                    LEFT JOIN books_series_link bsl ON b.id = bsl.series
+                    LEFT JOIN books_series_link bsl ON b.id = bsl.book
                     LEFT JOIN series s ON bsl.series = s.id
                     LEFT JOIN books_publishers_link bpl ON b.id = bpl.book
                     LEFT JOIN publishers p ON bpl.publisher = p.id
@@ -136,524 +189,658 @@ class Book:
                     WHERE b.id = ?
                     GROUP BY b.id, b.title, b.sort, b.pubdate, b.series_index,
                              s.name, s.sort, l.lang_code, c.text
-                """, (self.id,))
+                """
 
+                cursor.execute(query, (self.id,))
                 result = cursor.fetchone()
+
                 if not result:
-                    raise ValueError(f"Book with ID {self.id} not found")
+                    raise NotFoundError('book', str(self.id), 'ID')
 
-                # Assign all values from the single query
-                self.title = result[0] or ''
-                self.title_sort = result[1] or ''
-                self.date = result[2] or ''
-                self.series_idx = result[3] or 0.0
-                self.author = result[4] or ''
-                self.author_sort = result[5] or ''
-                self.series = result[6] or ''
-                self.series_sort = result[7] or ''
-                self.publisher = result[8] or ''
-                self.identifiers = result[9] or ''
-                self.language = result[10] or ''
-                self.synopsis = result[11] or ''
-                self.tags = result[12] or ''
-
-                # Clean up concatenated strings
-                if self.author:
-                    self.author = self.author.replace(',', ' & ')
-                if self.author_sort:
-                    self.author_sort = self.author_sort.replace(',', ' & ')
-                if self.publisher:
-                    self.publisher = self.publisher.replace(',', ' & ')
-                if self.identifiers:
-                    self.identifiers = self.identifiers.replace(',', ', ')
-                if self.tags:
-                    self.tags = self.tags.replace(',', ', ')
+                # Assign values from query result
+                self._assign_book_data(result)
 
         except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error while loading book {self.id}: {e}"
+            raise DatabaseError(
+                f'Failed to load book data for ID {self.id}: {e}',
+                'book_data_loading'
             )
 
-    def to_json(self) -> dict:
+    def _assign_book_data(self, result: sqlite3.Row) -> None:
+        """
+        Assign book data from database result to instance attributes.
+
+        Parameters
+        ----------
+        result : sqlite3.Row
+            Database query result row.
+        """
+        self.title = result[0] or ''
+        self.title_sort = result[1] or ''
+        self.date = result[2] or ''
+        self.series_idx = result[3] or 0.0
+        self.author = self._clean_concatenated_string(result[4])
+        self.author_sort = self._clean_concatenated_string(result[5])
+        self.series = result[6] or ''
+        self.series_sort = result[7] or ''
+        self.publisher = self._clean_concatenated_string(result[8])
+        self.identifiers = self._clean_identifiers(result[9])
+        self.language = result[10] or ''
+        self.synopsis = result[11] or ''
+        self.tags = self._clean_concatenated_string(result[12])
+
+    def _clean_concatenated_string(self, value: Optional[str]) -> str:
+        """
+        Clean concatenated string values from GROUP_CONCAT.
+
+        Parameters
+        ----------
+        value : str or None
+            The concatenated string value.
+
+        Returns
+        -------
+        str
+            Cleaned string with proper separators.
+        """
+        if not value:
+            return ''
+        return value.replace(',', ' & ')
+
+    def _clean_identifiers(self, value: Optional[str]) -> str:
+        """
+        Clean identifier strings with proper formatting.
+
+        Parameters
+        ----------
+        value : str or None
+            The concatenated identifier string.
+
+        Returns
+        -------
+        str
+            Cleaned identifiers with proper separators.
+        """
+        if not value:
+            return ''
+        return value.replace(',', ', ')
+
+    def to_json(self) -> Dict[str, Any]:
         """
         Return the book as a JSON-compatible dictionary.
 
-        Returns:
-            dict: Dictionary containing all book metadata.
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing all book metadata.
         """
         return {
-            "id": self.id,
-            "title": self.title,
-            "title_sort": self.title_sort,
-            "date": self.date,
-            "author": self.author,
-            "author_sort": self.author_sort,
-            "series": self.series,
-            "series_sort": self.series_sort,
-            "series_idx": self.series_idx,
-            "publisher": self.publisher,
-            "identifiers": self.identifiers,
-            "language": self.language,
-            "tags": self.tags,
-            "synopsis": self.synopsis
+            'id': self.id,
+            'title': self.title,
+            'title_sort': self.title_sort,
+            'date': self.date,
+            'author': self.author,
+            'author_sort': self.author_sort,
+            'series': self.series,
+            'series_sort': self.series_sort,
+            'series_idx': self.series_idx,
+            'publisher': self.publisher,
+            'identifiers': self.identifiers,
+            'language': self.language,
+            'tags': self.tags,
+            'synopsis': self.synopsis
         }
 
     def __str__(self) -> str:
         """
         Return a string representation of the book.
 
-        Returns:
-            str: Human-readable string representation.
+        Returns
+        -------
+        str
+            Human-readable string representation.
         """
-        return (f"Book(id={self.id}, title='{self.title}', "
-                f"author='{self.author}')")
+        return (
+            f"Book(id={self.id}, title='{self.title}', "
+            f"author='{self.author}')"
+        )
 
     def __repr__(self) -> str:
         """
         Return a detailed string representation for debugging.
 
-        Returns:
-            str: Detailed string representation.
+        Returns
+        -------
+        str
+            Detailed string representation.
         """
-        return (f"Book(id={self.id}, title='{self.title}', "
-                f"author='{self.author}', series='{self.series}')")
+        return (
+            f"Book(id={self.id}, title='{self.title}', "
+            f"author='{self.author}', series='{self.series}')"
+        )
 
 
 class CalibreDB:
     """
     Class to manage SQLite operations for Calibre database.
+
+    This class provides all database operations needed to search and
+    retrieve book metadata from a Calibre library database.
     """
 
-    def __init__(self, library_path: str, db_filename: str = 'metadata.db'):
+    def __init__(
+        self,
+        library_path: str,
+        db_filename: str = 'metadata.db'
+    ) -> None:
         """
-        Initialize CalibreDB with the path to the Calibre library and
-        database filename.
+        Initialize CalibreDB with the path to the Calibre library.
 
-        Args:
-            library_path (str): Path to the Calibre library folder.
-            db_filename (str): Name of the SQLite database file
-                (default: 'metadata.db').
+        Parameters
+        ----------
+        library_path : str
+            Path to the Calibre library folder.
+        db_filename : str, optional
+            Name of the SQLite database file, by default 'metadata.db'.
 
-        Raises:
-            ValueError: If library_path is empty or invalid.
-            FileNotFoundError: If the database file doesn't exist.
+        Raises
+        ------
+        ConfigurationError
+            If library_path is empty or invalid.
+        DatabaseError
+            If the database file doesn't exist.
         """
         if not library_path or not isinstance(library_path, str):
-            raise ValueError("Library path must be a non-empty string")
+            raise ConfigurationError(
+                'Library path must be a non-empty string',
+                'library_path'
+            )
 
+        self.library_path = library_path
         self.db_path = os.path.join(library_path, db_filename)
+
+        # Validate database exists
         if not os.path.exists(self.db_path):
-            raise FileNotFoundError(f"Database file not found: {self.db_path}")
+            raise DatabaseError(
+                f'Database file not found: {self.db_path}',
+                'initialization'
+            )
+
+        logger.info(f'CalibreDB initialized with database: {self.db_path}')
+
+    def _execute_search_query(
+        self,
+        query: str,
+        params: tuple,
+        operation: str
+    ) -> List[tuple]:
+        """
+        Execute a search query with error handling.
+
+        Parameters
+        ----------
+        query : str
+            SQL query to execute.
+        params : tuple
+            Query parameters.
+        operation : str
+            Description of the operation for error messages.
+
+        Returns
+        -------
+        List[tuple]
+            Query results.
+
+        Raises
+        ------
+        DatabaseError
+            If there's a database error during query execution.
+        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                return cursor.fetchall()
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                operation
+            )
 
     def search_books_by_title(
-        self, title_pattern: str
+        self,
+        title_pattern: str
     ) -> List[Tuple[int, str]]:
         """
         Search for books by title matching a pattern.
 
-        Args:
-            title_pattern (str): Pattern to search for in titles
-                (supports % wildcards).
+        Parameters
+        ----------
+        title_pattern : str
+            Pattern to search for in titles (supports % wildcards).
 
-        Returns:
-            List[Tuple[int, str]]: List of (book_id, title) tuples.
+        Returns
+        -------
+        List[Tuple[int, str]]
+            List of (book_id, title) tuples.
 
-        Raises:
-            ValueError: If pattern is empty.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If pattern is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not title_pattern or not isinstance(title_pattern, str):
-            raise ValueError("Title pattern must be a non-empty string")
+        validated_pattern = validate_search_parameters(title_pattern)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    'SELECT id, title FROM books WHERE title LIKE ? '
-                    'ORDER BY title',
-                    (title_pattern,)
-                )
-                return cursor.fetchall()
+        query = 'SELECT id, title FROM books WHERE title LIKE ? ORDER BY title'
+        results = self._execute_search_query(
+            query,
+            (validated_pattern,),
+            'title search'
+        )
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error searching books by title pattern "
-                f"'{title_pattern}': {e}"
+        if not results:
+            raise NotFoundError(
+                'books', validated_pattern, 'title pattern'
             )
 
+        return results
+
     def search_authors_by_name(
-        self, name_pattern: str
+        self,
+        name_pattern: str
     ) -> List[Tuple[int, str]]:
         """
         Search for authors by name matching a pattern.
 
-        Args:
-            name_pattern (str): Pattern to search for in names
-                (supports % wildcards).
+        Parameters
+        ----------
+        name_pattern : str
+            Pattern to search for in names (supports % wildcards).
 
-        Returns:
-            List[Tuple[int, str]]: List of (author_id, name) tuples.
+        Returns
+        -------
+        List[Tuple[int, str]]
+            List of (author_id, name) tuples.
 
-        Raises:
-            ValueError: If pattern is empty.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If pattern is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not name_pattern or not isinstance(name_pattern, str):
-            raise ValueError("Name pattern must be a non-empty string")
+        validated_pattern = validate_search_parameters(name_pattern)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    'SELECT id, name FROM authors WHERE name LIKE ? '
-                    'ORDER BY name',
-                    (name_pattern,)
-                )
-                return cursor.fetchall()
+        query = 'SELECT id, name FROM authors WHERE name LIKE ? ORDER BY name'
+        results = self._execute_search_query(
+            query,
+            (validated_pattern,),
+            'author name search'
+        )
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error searching authors by name pattern "
-                f"'{name_pattern}': {e}"
+        if not results:
+            raise NotFoundError(
+                'authors', validated_pattern, 'name pattern'
             )
+
+        return results
 
     def search_books_by_tag(
-        self, tag_pattern: str
+        self,
+        tag_pattern: str
     ) -> List[Tuple[int, str, str, str]]:
         """
-        Get detailed information about all books with tags matching a pattern.
+        Get detailed information about books with tags matching a pattern.
 
-        Args:
-            tag_pattern (str): Pattern to search for in tag names
-                (supports % wildcards).
+        Parameters
+        ----------
+        tag_pattern : str
+            Pattern to search for in tag names (supports % wildcards).
 
-        Returns:
-            List[Tuple[int, str, str, str]]: List of (book_id, title,
-                author_name, publication_date) tuples, ordered by title.
+        Returns
+        -------
+        List[Tuple[int, str, str, str]]
+            List of (book_id, title, author_name, publication_date) tuples,
+            ordered by title.
 
-        Raises:
-            ValueError: If pattern is empty or no books found.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If pattern is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not tag_pattern or not isinstance(tag_pattern, str):
-            raise ValueError("Tag pattern must be a non-empty string")
+        validated_pattern = validate_search_parameters(tag_pattern, 100)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT b.id, b.title,
-                           COALESCE(GROUP_CONCAT(a.name, ' & '), '')
-                           as authors,
-                           b.pubdate
-                    FROM books b
-                    JOIN books_tags_link btl ON b.id = btl.book
-                    JOIN tags t ON btl.tag = t.id
-                    LEFT JOIN books_authors_link bal ON b.id = bal.book
-                    LEFT JOIN authors a ON bal.author = a.id
-                    WHERE t.name LIKE ?
-                    GROUP BY b.id, b.title, b.pubdate
-                    ORDER BY b.title
-                """, (tag_pattern,))
+        query = """
+            SELECT DISTINCT b.id, b.title,
+                   COALESCE(GROUP_CONCAT(a.name, ' & '), '') as authors,
+                   b.pubdate
+            FROM books b
+            JOIN books_tags_link btl ON b.id = btl.book
+            JOIN tags t ON btl.tag = t.id
+            LEFT JOIN books_authors_link bal ON b.id = bal.book
+            LEFT JOIN authors a ON bal.author = a.id
+            WHERE t.name LIKE ?
+            GROUP BY b.id, b.title, b.pubdate
+            ORDER BY b.title
+        """
 
-                results = cursor.fetchall()
-                if not results:
-                    raise ValueError(
-                        f"No books found with tag pattern '{tag_pattern}'"
-                    )
+        results = self._execute_search_query(
+            query,
+            (validated_pattern,),
+            'tag pattern search'
+        )
 
-                return results
-
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error getting books with tag pattern "
-                f"'{tag_pattern}': {e}"
+        if not results:
+            raise NotFoundError(
+                'books', validated_pattern, 'tag pattern'
             )
 
+        return results
+
     def get_books_by_author(
-        self, author_name: str
+        self,
+        author_name: str
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about all books by a specific author.
 
-        Args:
-            author_name (str): Name of the author.
+        Parameters
+        ----------
+        author_name : str
+            Name of the author.
 
-        Returns:
-            List[Tuple[int, str, str, str]]: List of (book_id, title,
-                publication_date, series_info) tuples, ordered by
-                publication date.
+        Returns
+        -------
+        List[Tuple[int, str, str, str]]
+            List of (book_id, title, publication_date, series_info) tuples,
+            ordered by publication date.
 
-        Raises:
-            ValueError: If author name is empty or author not found.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If author name is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not author_name or not isinstance(author_name, str):
-            raise ValueError("Author name must be a non-empty string")
+        validated_name = validate_search_parameters(author_name)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT b.id, b.title, b.pubdate,
-                           CASE
-                               WHEN s.name IS NOT NULL
-                               THEN s.name || ' #' ||
-                                    CAST(b.series_index AS TEXT)
-                               ELSE ''
-                           END as series_info
-                    FROM books b
-                    JOIN books_authors_link bal ON b.id = bal.book
-                    JOIN authors a ON bal.author = a.id
-                    LEFT JOIN books_series_link bsl ON b.id = bsl.book
-                    LEFT JOIN series s ON bsl.series = s.id
-                    WHERE a.name = ?
-                    ORDER BY b.pubdate DESC, b.title
-                """, (author_name,))
+        query = """
+            SELECT DISTINCT b.id, b.title, b.pubdate,
+                   CASE
+                       WHEN s.name IS NOT NULL
+                       THEN s.name || ' #' || CAST(b.series_index AS TEXT)
+                       ELSE ''
+                   END as series_info
+            FROM books b
+            JOIN books_authors_link bal ON b.id = bal.book
+            JOIN authors a ON bal.author = a.id
+            LEFT JOIN books_series_link bsl ON b.id = bsl.book
+            LEFT JOIN series s ON bsl.series = s.id
+            WHERE a.name = ?
+            ORDER BY b.pubdate DESC, b.title
+        """
 
-                results = cursor.fetchall()
-                if not results:
-                    raise ValueError(
-                        f"No books found for author '{author_name}'"
-                    )
+        results = self._execute_search_query(
+            query,
+            (validated_name,),
+            'author books search'
+        )
 
-                return results
+        if not results:
+            raise NotFoundError('books', validated_name, 'author name')
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error getting books for author '{author_name}': {e}"
-            )
+        return results
 
     def get_books_by_author_id(
-        self, author_id: int
+        self,
+        author_id: int
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about all books by a specific author ID.
 
-        Args:
-            author_id (int): ID of the author.
+        Parameters
+        ----------
+        author_id : int
+            ID of the author.
 
-        Returns:
-            List[Tuple[int, str, str, str]]: List of (book_id, title,
-                publication_date, series_info) tuples, ordered by
-                publication date.
+        Returns
+        -------
+        List[Tuple[int, str, str, str]]
+            List of (book_id, title, publication_date, series_info) tuples,
+            ordered by publication date.
 
-        Raises:
-            ValueError: If author_id is not a positive integer or no
-                books found.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If author_id is not a positive integer.
+        DatabaseError
+            If there is a database error.
         """
-        if not isinstance(author_id, int) or author_id <= 0:
-            raise ValueError("Author ID must be a positive integer")
+        validated_id = validate_positive_integer(author_id, 'author_id')
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT b.id, b.title, b.pubdate,
-                           CASE
-                               WHEN s.name IS NOT NULL
-                               THEN s.name || ' #' ||
-                                    CAST(b.series_index AS TEXT)
-                               ELSE ''
-                           END as series_info
-                    FROM books b
-                    JOIN books_authors_link bal ON b.id = bal.book
-                    LEFT JOIN books_series_link bsl ON b.id = bsl.book
-                    LEFT JOIN series s ON bsl.series = s.id
-                    WHERE bal.author = ?
-                    ORDER BY b.pubdate DESC, b.title
-                """, (author_id,))
+        query = """
+            SELECT DISTINCT b.id, b.title, b.pubdate,
+                   CASE
+                       WHEN s.name IS NOT NULL
+                       THEN s.name || ' #' || CAST(b.series_index AS TEXT)
+                       ELSE ''
+                   END as series_info
+            FROM books b
+            JOIN books_authors_link bal ON b.id = bal.book
+            LEFT JOIN books_series_link bsl ON b.id = bsl.book
+            LEFT JOIN series s ON bsl.series = s.id
+            WHERE bal.author = ?
+            ORDER BY b.pubdate DESC, b.title
+        """
 
-                results = cursor.fetchall()
-                if not results:
-                    raise ValueError(
-                        f"No books found for author ID {author_id}"
-                    )
+        results = self._execute_search_query(
+            query,
+            (validated_id,),
+            'author ID books search'
+        )
 
-                return results
+        if not results:
+            raise NotFoundError('books', str(validated_id), 'author ID')
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error getting books for author ID {author_id}: {e}"
-            )
+        return results
 
     def get_books_by_series(
-        self, series_name: str
+        self,
+        series_name: str
     ) -> List[Tuple[int, str, float]]:
         """
         Get all books in a specific series.
 
-        Args:
-            series_name (str): Name of the series.
+        Parameters
+        ----------
+        series_name : str
+            Name of the series.
 
-        Returns:
-            List[Tuple[int, str, float]]: List of (book_id, title,
-                series_index) tuples, ordered by series index.
+        Returns
+        -------
+        List[Tuple[int, str, float]]
+            List of (book_id, title, series_index) tuples,
+            ordered by series index.
 
-        Raises:
-            ValueError: If series name is empty or series not found.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If series name is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not series_name or not isinstance(series_name, str):
-            raise ValueError("Series name must be a non-empty string")
+        validated_name = validate_search_parameters(series_name)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT b.id, b.title, b.series_index
-                    FROM books b
-                    JOIN books_series_link bsl ON b.id = bsl.book
-                    JOIN series s ON bsl.series = s.id
-                    WHERE s.name = ?
-                    ORDER BY b.series_index
-                """, (series_name,))
+        query = """
+            SELECT b.id, b.title, b.series_index
+            FROM books b
+            JOIN books_series_link bsl ON b.id = bsl.book
+            JOIN series s ON bsl.series = s.id
+            WHERE s.name = ?
+            ORDER BY b.series_index
+        """
 
-                results = cursor.fetchall()
-                if not results:
-                    raise ValueError(
-                        f"No books found for series '{series_name}'"
-                    )
+        results = self._execute_search_query(
+            query,
+            (validated_name,),
+            'series books search'
+        )
 
-                return results
+        if not results:
+            raise NotFoundError('books', validated_name, 'series name')
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error getting books for series "
-                f"'{series_name}': {e}"
-            )
+        return results
 
     def get_books_by_tag(
-        self, tag_name: str
+        self,
+        tag_name: str
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about all books with a specific tag.
 
-        Args:
-            tag_name (str): Name of the tag to search for.
+        Parameters
+        ----------
+        tag_name : str
+            Name of the tag to search for.
 
-        Returns:
-            List[Tuple[int, str, str, str]]: List of (book_id, title,
-                author_name, publication_date) tuples, ordered by title.
+        Returns
+        -------
+        List[Tuple[int, str, str, str]]
+            List of (book_id, title, author_name, publication_date) tuples,
+            ordered by title.
 
-        Raises:
-            ValueError: If tag name is empty or no books found with that tag.
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        ValidationError
+            If tag name is empty or invalid.
+        DatabaseError
+            If there is a database error.
         """
-        if not tag_name or not isinstance(tag_name, str):
-            raise ValueError("Tag name must be a non-empty string")
+        validated_name = validate_search_parameters(tag_name, 100)
 
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT b.id, b.title,
-                           COALESCE(GROUP_CONCAT(a.name, ' & '), '')
-                           as authors,
-                           b.pubdate
-                    FROM books b
-                    JOIN books_tags_link btl ON b.id = btl.book
-                    JOIN tags t ON btl.tag = t.id
-                    LEFT JOIN books_authors_link bal ON b.id = bal.book
-                    LEFT JOIN authors a ON bal.author = a.id
-                    WHERE t.name = ?
-                    GROUP BY b.id, b.title, b.pubdate
-                    ORDER BY b.title
-                """, (tag_name,))
+        query = """
+            SELECT DISTINCT b.id, b.title,
+                   COALESCE(GROUP_CONCAT(a.name, ' & '), '') as authors,
+                   b.pubdate
+            FROM books b
+            JOIN books_tags_link btl ON b.id = btl.book
+            JOIN tags t ON btl.tag = t.id
+            LEFT JOIN books_authors_link bal ON b.id = bal.book
+            LEFT JOIN authors a ON bal.author = a.id
+            WHERE t.name = ?
+            GROUP BY b.id, b.title, b.pubdate
+            ORDER BY b.title
+        """
 
-                results = cursor.fetchall()
-                if not results:
-                    raise ValueError(f"No books found with tag '{tag_name}'")
+        results = self._execute_search_query(
+            query,
+            (validated_name,),
+            'tag books search'
+        )
 
-                return results
+        if not results:
+            raise NotFoundError('books', validated_name, 'tag name')
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(
-                f"Database error getting books with tag '{tag_name}': {e}"
-            )
+        return results
 
     def get_all_tags(self) -> List[Tuple[int, str]]:
         """
         Get all available tags in the database.
 
-        Returns:
-            List[Tuple[int, str]]: List of (tag_id, tag_name) tuples,
-                ordered alphabetically by name.
+        Returns
+        -------
+        List[Tuple[int, str]]
+            List of (tag_id, tag_name) tuples, ordered alphabetically by name.
 
-        Raises:
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        DatabaseError
+            If there is a database error.
         """
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT t.id, t.name
-                    FROM tags t
-                    ORDER BY t.name
-                """)
-                return cursor.fetchall()
+        query = 'SELECT t.id, t.name FROM tags t ORDER BY t.name'
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(f"Database error getting all tags: {e}")
+        return self._execute_search_query(
+            query,
+            (),
+            'get all tags'
+        )
 
     def get_book_count(self) -> int:
         """
         Get the total number of books in the database.
 
-        Returns:
-            int: Total number of books.
+        Returns
+        -------
+        int
+            Total number of books.
 
-        Raises:
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        DatabaseError
+            If there is a database error.
         """
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM books')
-                result = cursor.fetchone()
-                return int(result[0])
+        query = 'SELECT COUNT(*) FROM books'
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(f"Database error counting books: {e}")
+        results = self._execute_search_query(
+            query,
+            (),
+            'book count'
+        )
+
+        return int(results[0][0]) if results else 0
 
     def get_author_count(self) -> int:
         """
         Get the total number of authors in the database.
 
-        Returns:
-            int: Total number of authors.
+        Returns
+        -------
+        int
+            Total number of authors.
 
-        Raises:
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        DatabaseError
+            If there is a database error.
         """
-        try:
-            with database_connection(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM authors')
-                result = cursor.fetchone()
-                return int(result[0])
+        query = 'SELECT COUNT(*) FROM authors'
 
-        except sqlite3.Error as e:
-            raise sqlite3.Error(f"Database error counting authors: {e}")
+        results = self._execute_search_query(
+            query,
+            (),
+            'author count'
+        )
 
-    def get_database_info(self) -> dict:
+        return int(results[0][0]) if results else 0
+
+    def get_database_info(self) -> Dict[str, Any]:
         """
         Get comprehensive information about the database.
 
-        Returns:
-            dict: Dictionary containing database statistics.
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing database statistics and information.
 
-        Raises:
-            sqlite3.Error: If there is a database error.
+        Raises
+        ------
+        DatabaseError
+            If there is a database error.
         """
         try:
             info = {
                 'db_path': self.db_path,
+                'library_path': self.library_path,
                 'books_count': self.get_book_count(),
                 'authors_count': self.get_author_count(),
             }
 
+            # Get additional counts in a single connection
             with database_connection(self.db_path) as conn:
                 cursor = conn.cursor()
 
@@ -676,4 +863,7 @@ class CalibreDB:
             return info
 
         except sqlite3.Error as e:
-            raise sqlite3.Error(f"Database error getting database info: {e}")
+            raise DatabaseError(
+                f'Failed to retrieve database information: {e}',
+                'database info'
+            )

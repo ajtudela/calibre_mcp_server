@@ -5,62 +5,172 @@ This server provides tools to interact with a Calibre e-book library,
 allowing search and retrieval of book metadata through the MCP protocol.
 """
 
-import os
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, NoReturn
 from typing import Annotated
 
 from .calibre_api import Book, CalibreDB
-from fastmcp import FastMCP
+from .config import config
+from .exceptions import (
+    DatabaseError,
+    ValidationError,
+    NotFoundError
+)
+from .validation import (
+    validate_search_parameters,
+    validate_positive_integer
+)
+
+from fastmcp import FastMCP, Context
 from fastmcp.exceptions import ToolError
-from dotenv import load_dotenv, find_dotenv
 from pydantic import Field
 
 
-# Load environment variables: prefer a .env in the current working directory
-# (so running the installed package from the project root works). If not
-# found, fallback to the .env bundled next to the package file.
-dot_env_path = find_dotenv(usecwd=True)
-if dot_env_path:
-    load_dotenv(dot_env_path)
-else:
-    # fallback: .env next to this file's parent directory
-    env_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        '.env'
-    )
-    load_dotenv(env_path)
-
-#############################################
-# Configuration
-#############################################
-CALIBRE_LIBRARY_PATH: str = os.getenv("CALIBRE_LIBRARY_PATH", "")
-
-if not CALIBRE_LIBRARY_PATH:
-    raise ValueError(
-        "CALIBRE_LIBRARY_PATH is not set in the .env file. Add it to .env."
-    )
-
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP(name="Calibre MCP Server")
+# Initialize FastMCP server with configuration
+mcp = FastMCP(name=config.server_name)
 
 # Initialize CalibreDB instance
 try:
-    calibre_db = CalibreDB(CALIBRE_LIBRARY_PATH)
-    logger.info(f"Calibre database initialized at: {CALIBRE_LIBRARY_PATH}")
+    calibre_db = CalibreDB(config.calibre_library_path)
+    logger.info(
+        f"Calibre database initialized at: {config.calibre_library_path}"
+    )
 except Exception as e:
     logger.error(f"Failed to initialize Calibre database: {e}")
     raise
 
 
+class CalibreToolHandler:
+    """Handler class for Calibre MCP tools with centralized error handling."""
+
+    @staticmethod
+    async def handle_error(
+        operation: str,
+        error: Exception,
+        search_term: Optional[str] = None,
+        ctx: Optional[Context] = None
+    ) -> NoReturn:
+        """
+        Centralized error handling for all operations.
+
+        Parameters
+        ----------
+        operation : str
+            The operation being performed.
+        error : Exception
+            The exception that was raised.
+        search_term : str, optional
+            The search term used, by default None.
+        ctx : Context, optional
+            The MCP context for logging, by default None.
+
+        Raises
+        ------
+        ToolError
+            Formatted error for MCP client.
+        """
+        error_msg = str(error)
+
+        # Log error to context if available
+        if ctx:
+            if search_term:
+                await ctx.error(
+                    f"Error in {operation} for '{search_term}': {error_msg}"
+                )
+            else:
+                await ctx.error(f"Error in {operation}: {error_msg}")
+
+        # Also log to standard logger for server-side debugging
+        logger.error(f"Error in {operation}: {error}")
+
+        if isinstance(error, (ValueError, ValidationError)):
+            raise ToolError(str(error))
+        elif isinstance(error, (DatabaseError, NotFoundError)):
+            raise ToolError(str(error))
+        else:
+            if search_term:
+                raise ToolError(
+                    f"Database error occurred while {operation} "
+                    f"for '{search_term}': {str(error)}"
+                )
+            else:
+                raise ToolError(
+                    f"Database error occurred during {operation}: "
+                    f"{str(error)}"
+                )
+
+    @staticmethod
+    def format_simple_results(
+        results: List[tuple],
+        id_key: str = "id",
+        value_key: str = "name"
+    ) -> List[Dict[str, Any]]:
+        """
+        Format simple id, value tuple results.
+
+        Parameters
+        ----------
+        results : List[tuple]
+            Raw database results with (id, value) structure.
+        id_key : str, optional
+            Key name for ID field, by default "id".
+        value_key : str, optional
+            Key name for value field, by default "name".
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Formatted dictionaries.
+        """
+        return [{id_key: item[0], value_key: item[1]} for item in results]
+
+    @staticmethod
+    def format_book_search_results(
+        results: List[tuple],
+        context: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Format book search results with appropriate context.
+
+        Parameters
+        ----------
+        results : List[tuple]
+            Raw database results.
+        context : str, optional
+            Additional context information, by default None.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Formatted book dictionaries.
+        """
+        books = []
+        for result in results:
+            book_dict = {
+                "id": result[0],
+                "title": result[1],
+            }
+
+            # Handle different result formats based on length
+            if len(result) == 4:  # author or tag search results
+                book_dict["authors"] = result[2] or ""
+                book_dict["publication_date"] = result[3] or ""
+                if context:
+                    book_dict["context"] = context
+            elif len(result) == 3:  # series search results
+                book_dict["series_index"] = result[2] or 0.0
+                if context:
+                    book_dict["series_name"] = context
+
+            books.append(book_dict)
+        return books
+
+
 #############################################
-# Tools - Search Functions
+# Search Tools
 #############################################
 
 
@@ -77,7 +187,7 @@ except Exception as e:
         "openWorldHint": False
     }
 )
-def search_books_by_title(
+async def search_books_by_title(
     title_pattern: Annotated[str, Field(
         description=(
             "Title pattern to search for (use % for wildcards, "
@@ -85,9 +195,11 @@ def search_books_by_title(
         ),
         min_length=1,
         max_length=200
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Search for books by title using pattern matching.
+    """
+    Search for books by title using pattern matching.
 
     Parameters
     ----------
@@ -105,19 +217,32 @@ def search_books_by_title(
         If search fails or no books are found.
     """
     try:
-        results = calibre_db.search_books_by_title(title_pattern)
+        await ctx.info(f"Searching books by title pattern: '{title_pattern}'")
+
+        validated_pattern = validate_search_parameters(title_pattern)
+        results = calibre_db.search_books_by_title(validated_pattern)
+
         if not results:
-            raise ToolError(
-                f"No books found with title pattern: '{title_pattern}'"
+            await ctx.warning(
+                f"No books found matching pattern: '{validated_pattern}'"
+            )
+            raise NotFoundError(
+                "books", validated_pattern, "title pattern"
             )
 
-        return [{"id": book_id, "title": title} for book_id, title in results]
-    except ValueError as e:
-        raise ToolError(str(e))
+        await ctx.info(f"Found {len(results)} books matching title pattern")
+        formatted_results = CalibreToolHandler.format_simple_results(
+            results, "id", "title"
+        )
+
+        await ctx.debug(
+            f"Returning {len(formatted_results)} formatted results"
+        )
+        return formatted_results
+
     except Exception as e:
-        logger.error(f"Error searching books by title: {e}")
-        raise ToolError(
-            f"Database error occurred while searching for books: {str(e)}"
+        await CalibreToolHandler.handle_error(
+            "searching books by title", e, title_pattern, ctx
         )
 
 
@@ -134,7 +259,7 @@ def search_books_by_title(
         "openWorldHint": False
     }
 )
-def search_authors_by_name(
+async def search_authors_by_name(
     name_pattern: Annotated[str, Field(
         description=(
             "Author name pattern to search for (use % for wildcards, "
@@ -142,9 +267,11 @@ def search_authors_by_name(
         ),
         min_length=1,
         max_length=200
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Search for authors by name using pattern matching.
+    """
+    Search for authors by name using pattern matching.
 
     Parameters
     ----------
@@ -162,21 +289,30 @@ def search_authors_by_name(
         If search fails or no authors are found.
     """
     try:
-        results = calibre_db.search_authors_by_name(name_pattern)
+        await ctx.info(f"Searching authors by name pattern: '{name_pattern}'")
+
+        validated_pattern = validate_search_parameters(name_pattern)
+        results = calibre_db.search_authors_by_name(validated_pattern)
+
         if not results:
-            raise ToolError(
-                f"No authors found with name pattern: '{name_pattern}'"
+            await ctx.warning(
+                f"No authors found matching pattern: '{validated_pattern}'"
+            )
+            raise NotFoundError(
+                "authors", validated_pattern, "name pattern"
             )
 
-        return [
-            {"id": author_id, "name": name} for author_id, name in results
-        ]
-    except ValueError as e:
-        raise ToolError(str(e))
+        await ctx.info(f"Found {len(results)} authors matching name pattern")
+        formatted_results = CalibreToolHandler.format_simple_results(results)
+
+        await ctx.debug(
+            f"Returning {len(formatted_results)} formatted results"
+        )
+        return formatted_results
+
     except Exception as e:
-        logger.error(f"Error searching authors by name: {e}")
-        raise ToolError(
-            f"Database error occurred while searching for authors: {str(e)}"
+        await CalibreToolHandler.handle_error(
+            "searching authors by name", e, name_pattern, ctx
         )
 
 
@@ -190,14 +326,16 @@ def search_authors_by_name(
         "openWorldHint": False
     }
 )
-def get_books_by_author(
+async def get_books_by_author(
     author_name: Annotated[str, Field(
         description="Exact name of the author to search for",
         min_length=1,
         max_length=200
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Get detailed information about all books by a specific author.
+    """
+    Get detailed information about all books by a specific author.
 
     Parameters
     ----------
@@ -215,24 +353,33 @@ def get_books_by_author(
         If author not found or database error occurs.
     """
     try:
-        results = calibre_db.get_books_by_author(author_name)
+        await ctx.info(f"Getting books by author: '{author_name}'")
+
+        validated_name = validate_search_parameters(author_name)
+        results = calibre_db.get_books_by_author(validated_name)
+
+        if not results:
+            await ctx.warning(f"No books found for author: '{validated_name}'")
+
+        await ctx.info(f"Found {len(results)} books by author")
 
         books = []
         for book_id, title, pub_date, series_info in results:
             books.append({
                 "id": book_id,
                 "title": title,
-                "publication_date": pub_date,
-                "series_info": series_info,
-                "author": author_name
+                "publication_date": pub_date or "",
+                "series_info": series_info or "",
+                "author": validated_name
             })
 
+        await ctx.debug(f"Returning {len(books)} book records")
         return books
-    except ValueError as e:
-        raise ToolError(str(e))
+
     except Exception as e:
-        logger.error(f"Error getting books by author: {e}")
-        raise ToolError(f"Database error occurred: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting books by author", e, author_name, ctx
+        )
 
 
 @mcp.tool(
@@ -245,13 +392,15 @@ def get_books_by_author(
         "openWorldHint": False
     }
 )
-def get_books_by_author_id(
+async def get_books_by_author_id(
     author_id: Annotated[int, Field(
         description="Unique ID of the author in the Calibre database",
         gt=0
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Get detailed information about all books by a specific author ID.
+    """
+    Get detailed information about all books by a specific author ID.
 
     Parameters
     ----------
@@ -269,24 +418,30 @@ def get_books_by_author_id(
         If author not found or database error occurs.
     """
     try:
-        results = calibre_db.get_books_by_author_id(author_id)
+        await ctx.info(f"Getting books by author ID: {author_id}")
+
+        validated_id = validate_positive_integer(author_id, "author_id")
+        results = calibre_db.get_books_by_author_id(validated_id)
+
+        await ctx.info(f"Found {len(results)} books by author ID")
 
         books = []
         for book_id, title, pub_date, series_info in results:
             books.append({
                 "id": book_id,
                 "title": title,
-                "publication_date": pub_date,
-                "series_info": series_info,
-                "author_id": author_id
+                "publication_date": pub_date or "",
+                "series_info": series_info or "",
+                "author_id": validated_id
             })
 
+        await ctx.debug(f"Returning {len(books)} book records")
         return books
-    except ValueError as e:
-        raise ToolError(str(e))
+
     except Exception as e:
-        logger.error(f"Error getting books by author ID: {e}")
-        raise ToolError(f"Database error occurred: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting books by author ID", e, str(author_id), ctx
+        )
 
 
 @mcp.tool(
@@ -299,14 +454,16 @@ def get_books_by_author_id(
         "openWorldHint": False
     }
 )
-def get_books_by_series(
+async def get_books_by_series(
     series_name: Annotated[str, Field(
         description="Exact name of the series to search for",
         min_length=1,
         max_length=200
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Get all books in a specific series ordered by series index.
+    """
+    Get all books in a specific series ordered by series index.
 
     Parameters
     ----------
@@ -324,23 +481,29 @@ def get_books_by_series(
         If series not found or database error occurs.
     """
     try:
-        results = calibre_db.get_books_by_series(series_name)
+        await ctx.info(f"Getting books in series: '{series_name}'")
+
+        validated_name = validate_search_parameters(series_name)
+        results = calibre_db.get_books_by_series(validated_name)
+
+        await ctx.info(f"Found {len(results)} books in series")
 
         books = []
         for book_id, title, series_index in results:
             books.append({
                 "id": book_id,
                 "title": title,
-                "series_index": series_index,
-                "series_name": series_name
+                "series_index": series_index or 0.0,
+                "series_name": validated_name
             })
 
+        await ctx.debug(f"Returning {len(books)} series books")
         return books
-    except ValueError as e:
-        raise ToolError(str(e))
+
     except Exception as e:
-        logger.error(f"Error getting books by series: {e}")
-        raise ToolError(f"Database error occurred: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting books by series", e, series_name, ctx
+        )
 
 
 @mcp.tool(
@@ -353,14 +516,16 @@ def get_books_by_series(
         "openWorldHint": False
     }
 )
-def get_books_by_tag(
+async def get_books_by_tag(
     tag_name: Annotated[str, Field(
         description="Exact name of the tag to search for",
         min_length=1,
         max_length=100
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Get detailed information about all books with a specific tag.
+    """
+    Get detailed information about all books with a specific tag.
 
     Parameters
     ----------
@@ -378,24 +543,30 @@ def get_books_by_tag(
         If tag not found or database error occurs.
     """
     try:
-        results = calibre_db.get_books_by_tag(tag_name)
+        await ctx.info(f"Getting books with tag: '{tag_name}'")
+
+        validated_name = validate_search_parameters(tag_name, 100)
+        results = calibre_db.get_books_by_tag(validated_name)
+
+        await ctx.info(f"Found {len(results)} books with tag")
 
         books = []
         for book_id, title, authors, pub_date in results:
             books.append({
                 "id": book_id,
                 "title": title,
-                "authors": authors,
-                "publication_date": pub_date,
-                "tag": tag_name
+                "authors": authors or "",
+                "publication_date": pub_date or "",
+                "tag": validated_name
             })
 
+        await ctx.debug(f"Returning {len(books)} tagged books")
         return books
-    except ValueError as e:
-        raise ToolError(str(e))
+
     except Exception as e:
-        logger.error(f"Error getting books by tag: {e}")
-        raise ToolError(f"Database error occurred: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting books by tag", e, tag_name, ctx
+        )
 
 
 @mcp.tool(
@@ -411,7 +582,7 @@ def get_books_by_tag(
         "openWorldHint": False
     }
 )
-def search_books_by_tag_pattern(
+async def search_books_by_tag_pattern(
     tag_pattern: Annotated[str, Field(
         description=(
             "Tag pattern to search for (use % for wildcards, "
@@ -419,9 +590,11 @@ def search_books_by_tag_pattern(
         ),
         min_length=1,
         max_length=100
-    )]
+    )],
+    ctx: Context
 ) -> List[Dict[str, Any]]:
-    """Search for books with tags matching a pattern.
+    """
+    Search for books with tags matching a pattern.
 
     Parameters
     ----------
@@ -439,28 +612,34 @@ def search_books_by_tag_pattern(
         If no books found or database error occurs.
     """
     try:
-        results = calibre_db.search_books_by_tag(tag_pattern)
+        await ctx.info(f"Searching books by tag pattern: '{tag_pattern}'")
+
+        validated_pattern = validate_search_parameters(tag_pattern, 100)
+        results = calibre_db.search_books_by_tag(validated_pattern)
+
+        await ctx.info(f"Found {len(results)} books matching tag pattern")
 
         books = []
         for book_id, title, authors, pub_date in results:
             books.append({
                 "id": book_id,
                 "title": title,
-                "authors": authors,
-                "publication_date": pub_date,
-                "matching_tag_pattern": tag_pattern
+                "authors": authors or "",
+                "publication_date": pub_date or "",
+                "matching_tag_pattern": validated_pattern
             })
 
+        await ctx.debug(f"Returning {len(books)} pattern-matched books")
         return books
-    except ValueError as e:
-        raise ToolError(str(e))
+
     except Exception as e:
-        logger.error(f"Error searching books by tag pattern: {e}")
-        raise ToolError(f"Database error occurred: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "searching books by tag pattern", e, tag_pattern, ctx
+        )
 
 
 #############################################
-# Tools - Book Information
+# Book Information Tools
 #############################################
 
 
@@ -474,13 +653,15 @@ def search_books_by_tag_pattern(
         "openWorldHint": False
     }
 )
-def get_book_details(
+async def get_book_details(
     book_id: Annotated[int, Field(
         description="Unique ID of the book in the Calibre database",
         gt=0
-    )]
+    )],
+    ctx: Context
 ) -> Dict[str, Any]:
-    """Get complete metadata for a specific book.
+    """
+    Get complete metadata for a specific book.
 
     Parameters
     ----------
@@ -498,19 +679,24 @@ def get_book_details(
         If book not found or database error occurs.
     """
     try:
-        book = Book(book_id, CALIBRE_LIBRARY_PATH)
-        return book.to_json()
-    except ValueError as e:
-        raise ToolError(str(e))
-    except FileNotFoundError as e:
-        raise ToolError(f"Database file not found: {str(e)}")
+        await ctx.info(f"Getting details for book ID: {book_id}")
+
+        validated_id = validate_positive_integer(book_id, "book_id")
+        book = Book(validated_id, config.calibre_library_path)
+        book_details = book.to_json()
+
+        book_title = book_details.get('title', 'Unknown')
+        await ctx.debug(f"Retrieved details for book: '{book_title}'")
+        return book_details
+
     except Exception as e:
-        logger.error(f"Error getting book details: {e}")
-        raise ToolError(f"Error retrieving book details: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting book details", e, str(book_id), ctx
+        )
 
 
 #############################################
-# Tools - Library Statistics and Information
+# Library Information Tools
 #############################################
 
 
@@ -524,8 +710,9 @@ def get_book_details(
         "openWorldHint": False
     }
 )
-def get_library_stats() -> Dict[str, Any]:
-    """Get comprehensive statistics about the Calibre library.
+async def get_library_stats(ctx: Context) -> Dict[str, Any]:
+    """
+    Get comprehensive statistics about the Calibre library.
 
     Returns
     -------
@@ -538,10 +725,18 @@ def get_library_stats() -> Dict[str, Any]:
         If database error occurs.
     """
     try:
-        return calibre_db.get_database_info()
+        await ctx.info("Getting library statistics")
+
+        stats = calibre_db.get_database_info()
+
+        total_books = stats.get('total_books', 0)
+        await ctx.debug(f"Library contains {total_books} books")
+        return stats
+
     except Exception as e:
-        logger.error(f"Error getting library stats: {e}")
-        raise ToolError(f"Error retrieving library statistics: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting library statistics", e, None, ctx
+        )
 
 
 @mcp.tool(
@@ -554,8 +749,9 @@ def get_library_stats() -> Dict[str, Any]:
         "openWorldHint": False
     }
 )
-def get_all_tags() -> List[Dict[str, Any]]:
-    """Get all available tags in the Calibre library.
+async def get_all_tags(ctx: Context) -> List[Dict[str, Any]]:
+    """
+    Get all available tags in the Calibre library.
 
     Returns
     -------
@@ -568,24 +764,40 @@ def get_all_tags() -> List[Dict[str, Any]]:
         If database error occurs.
     """
     try:
+        await ctx.info("Getting all available tags")
+
         results = calibre_db.get_all_tags()
-        return [{"id": tag_id, "name": tag_name}
-                for tag_id, tag_name in results]
+        formatted_results = CalibreToolHandler.format_simple_results(results)
+
+        await ctx.debug(f"Found {len(formatted_results)} tags")
+        return formatted_results
+
     except Exception as e:
-        logger.error(f"Error getting all tags: {e}")
-        raise ToolError(f"Error retrieving tags: {str(e)}")
+        await CalibreToolHandler.handle_error(
+            "getting all tags", e, None, ctx
+        )
 
 
 def main() -> None:
-    """Run the MCP server.
-
-    Notes
-    -----
-    Default transport is stdio for local MCP integration. Uncomment the
-    HTTP line for network serving inside a container environment.
     """
-    # mcp.run(transport="http", host="0.0.0.0", port=9001)
-    mcp.run(transport="stdio")
+    Run the MCP server.
+
+    The server uses the transport mode configured in the config module.
+    Default is stdio for local MCP integration. HTTP mode can be used
+    for network serving in container environments.
+    """
+    if config.transport_mode.lower() == "http":
+        logger.info(
+            f"Starting HTTP server on {config.http_host}:{config.http_port}"
+        )
+        mcp.run(
+            transport="http",
+            host=config.http_host,
+            port=config.http_port
+        )
+    else:
+        logger.info("Starting server with stdio transport")
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
