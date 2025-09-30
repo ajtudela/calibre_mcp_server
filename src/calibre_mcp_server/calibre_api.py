@@ -128,6 +128,7 @@ class Book:
         self.language = ''
         self.synopsis = ''
         self.tags = ''
+        self.custom_columns: Dict[str, Optional[str]] = {}
 
         # Set up database path
         self.db_path = os.path.join(library_path, db_filename)
@@ -200,6 +201,9 @@ class Book:
                 # Assign values from query result
                 self._assign_book_data(result)
 
+                # Load custom columns data
+                self._load_custom_columns()
+
         except sqlite3.Error as e:
             raise DatabaseError(
                 f'Failed to load book data for ID {self.id}: {e}',
@@ -265,6 +269,158 @@ class Book:
             return ''
         return value.replace(',', ', ')
 
+    def _load_custom_columns(self) -> None:
+        """
+        Load custom column data for the book from Calibre database.
+
+        This method retrieves custom column definitions and their values
+        for the specific book. It handles both direct custom_column_* tables
+        and books_custom_column_*_link tables.
+
+        Raises
+        ------
+        DatabaseError
+            If there's a database error during custom columns loading.
+        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # First, check if custom_columns table exists
+                cursor.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='custom_columns'
+                """)
+                if not cursor.fetchone():
+                    logger.debug(
+                        f"Book {self.id}: No custom_columns table found")
+                    return
+
+                # Get all custom columns metadata
+                cursor.execute("""
+                    SELECT id, label
+                    FROM custom_columns
+                    ORDER BY label
+                """)
+                custom_columns_info = cursor.fetchall()
+
+                if not custom_columns_info:
+                    logger.debug(
+                        f"Book {self.id}: No custom columns defined in library"
+                    )
+                    return
+
+                logger.debug(
+                    f"Book {self.id}: Found {len(custom_columns_info)} "
+                    f"custom columns"
+                )
+
+                # Process each custom column
+                for column_id, label in custom_columns_info:
+                    logger.debug(
+                        f"Book {self.id}: Processing custom column "
+                        f"{column_id} ('{label}')"
+                    )
+
+                    link_table = f'books_custom_column_{column_id}_link'
+                    direct_table = f'custom_column_{column_id}'
+
+                    value = None
+
+                    # First, check if link table exists and get value
+                    # for this book
+                    cursor.execute("""
+                        SELECT name FROM sqlite_master
+                        WHERE type='table' AND name=?
+                    """, (link_table,))
+
+                    link_table_exists = cursor.fetchone()
+                    logger.debug(
+                        f"Book {self.id}: Table '{link_table}' exists: "
+                        f"{bool(link_table_exists)}"
+                    )
+
+                    if link_table_exists:
+                        cursor.execute(f"""
+                            SELECT value FROM {link_table}
+                            WHERE book = ?
+                        """, (self.id,))
+
+                        link_results = cursor.fetchall()
+                        if link_results:
+                            logger.debug(
+                                f"Book {self.id}: Found {len(link_results)} "
+                                f"values in {link_table}"
+                            )
+
+                            # Handle multiple values (concatenate with ' & ')
+                            values = []
+                            for result in link_results:
+                                link_value = result[0]
+
+                                # Try to resolve value from direct table
+                                # if it's numeric
+                                resolved_value = link_value
+                                try:
+                                    is_int_str = isinstance(
+                                        link_value, (int, str)
+                                    )
+                                    is_digit = str(link_value).isdigit()
+                                    if is_int_str and is_digit:
+                                        # Check if direct custom column
+                                        # table exists
+                                        cursor.execute("""
+                                            SELECT name FROM sqlite_master
+                                            WHERE type='table' AND name=?
+                                        """, (direct_table,))
+
+                                        if cursor.fetchone():
+                                            query = (
+                                                f"SELECT value FROM "
+                                                f"{direct_table} WHERE id = ?"
+                                            )
+                                            cursor.execute(
+                                                query, (int(link_value),)
+                                            )
+                                            direct_result = cursor.fetchone()
+                                            if direct_result:
+                                                resolved_value = (
+                                                    direct_result[0]
+                                                )
+                                                logger.debug(
+                                                    f"Book {self.id}: "
+                                                    f"Resolved value "
+                                                    f"{link_value} -> "
+                                                    f"'{resolved_value}'"
+                                                )
+                                except (ValueError, TypeError):
+                                    # Use original value if conversion fails
+                                    pass
+
+                                values.append(str(resolved_value))
+
+                            # Join multiple values with ' & '
+                            value = ' & '.join(values) if len(
+                                values) > 1 else values[0]
+                        else:
+                            logger.debug(
+                                f"Book {self.id}: No values found in "
+                                f"{link_table}"
+                            )
+
+                    # Store the custom column value
+                    self.custom_columns[label] = value
+                    logger.debug(
+                        f"Book {self.id}: Set custom_columns['{label}'] = "
+                        f"'{value}'"
+                    )
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Failed to load custom columns for book ID {self.id}: {e}',
+                'custom_columns_loading'
+            )
+
     def to_json(self) -> Dict[str, Any]:
         """
         Return the book as a JSON-compatible dictionary.
@@ -288,7 +444,8 @@ class Book:
             'identifiers': self.identifiers,
             'language': self.language,
             'tags': self.tags,
-            'synopsis': self.synopsis
+            'synopsis': self.synopsis,
+            'custom_columns': self.custom_columns
         }
 
     def __str__(self) -> str:
