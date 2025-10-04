@@ -115,6 +115,7 @@ class Book:
             )
 
         # Initialize attributes with default values
+        self.library_path = library_path
         self.title = ''
         self.title_sort = ''
         self.date = ''
@@ -128,6 +129,7 @@ class Book:
         self.language = ''
         self.synopsis = ''
         self.tags = ''
+        self.cover = ''
         self.custom_columns: Dict[str, Optional[str]] = {}
 
         # Set up database path
@@ -161,6 +163,7 @@ class Book:
                         b.sort,
                         b.pubdate,
                         b.series_index,
+                        b.path,
                         GROUP_CONCAT(DISTINCT a.name ORDER BY a.name)
                         as authors,
                         GROUP_CONCAT(DISTINCT a.sort ORDER BY a.sort)
@@ -189,7 +192,7 @@ class Book:
                     LEFT JOIN tags t ON btl.tag = t.id
                     WHERE b.id = ?
                     GROUP BY b.id, b.title, b.sort, b.pubdate, b.series_index,
-                             s.name, s.sort, l.lang_code, c.text
+                             b.path, s.name, s.sort, l.lang_code, c.text
                 """
 
                 cursor.execute(query, (self.id,))
@@ -223,15 +226,16 @@ class Book:
         self.title_sort = result[1] or ''
         self.date = result[2] or ''
         self.series_idx = result[3] or 0.0
-        self.author = self._clean_concatenated_string(result[4])
-        self.author_sort = self._clean_concatenated_string(result[5])
-        self.series = result[6] or ''
-        self.series_sort = result[7] or ''
-        self.publisher = self._clean_concatenated_string(result[8])
-        self.identifiers = self._clean_identifiers(result[9])
-        self.language = result[10] or ''
-        self.synopsis = result[11] or ''
-        self.tags = self._clean_concatenated_string(result[12])
+        self.author = self._clean_concatenated_string(result[5])
+        self.author_sort = self._clean_concatenated_string(result[6])
+        self.series = result[7] or ''
+        self.series_sort = result[8] or ''
+        self.publisher = self._clean_concatenated_string(result[9])
+        self.identifiers = self._clean_identifiers(result[10])
+        self.language = result[11] or ''
+        self.synopsis = result[12] or ''
+        self.tags = self._clean_concatenated_string(result[13])
+        self.cover = os.path.join(self.library_path, result[4], 'cover.jpg')
 
     def _clean_concatenated_string(self, value: Optional[str]) -> str:
         """
@@ -445,6 +449,7 @@ class Book:
             'language': self.language,
             'tags': self.tags,
             'synopsis': self.synopsis,
+            'cover': self.cover,
             'custom_columns': self.custom_columns
         }
 
