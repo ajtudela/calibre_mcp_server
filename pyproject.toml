@@ -1,5 +1,5 @@
 [project]
-name = "calibre_mcp_server"
+name = "calibre-mcp-server"
 version = "1.1.0"
 description = "An MCP server for Calibre"
 requires-python = ">=3.10"
