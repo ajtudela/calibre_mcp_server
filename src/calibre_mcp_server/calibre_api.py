@@ -8,6 +8,7 @@ SQLite database, including book metadata retrieval and search operations.
 import os
 import sqlite3
 import logging
+import unicodedata
 from typing import List, Tuple, Generator, Dict, Any, Optional
 from contextlib import contextmanager
 from pathlib import Path
@@ -530,6 +531,51 @@ class CalibreDB:
 
         logger.info(f'CalibreDB initialized with database: {self.db_path}')
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """
+        Normalize text by removing diacritics (accents) for comparison.
+
+        This function converts characters with diacritics to their base form,
+        making searches accent-insensitive, while preserving special letters
+        like 'ñ', 'Ñ', 'ç', and 'Ç'.
+
+        Parameters
+        ----------
+        text : str
+            The text to normalize.
+
+        Returns
+        -------
+        str
+            The normalized text without diacritics but preserving ñ/Ñ/ç/Ç.
+        """
+        if not text:
+            return text
+
+        # Preserve ñ, Ñ, ç, and Ç by temporarily replacing them
+        text = text.replace('ñ', '\u0001')  # Placeholder for ñ
+        text = text.replace('Ñ', '\u0002')  # Placeholder for Ñ
+        text = text.replace('ç', '\u0003')  # Placeholder for ç
+        text = text.replace('Ç', '\u0004')  # Placeholder for Ç
+
+        # Decompose characters into base + diacritics (NFD normalization)
+        # Then filter out the diacritical marks (combining characters)
+        normalized = unicodedata.normalize('NFD', text)
+        # Filter out combining characters (accents, tildes, etc.)
+        without_accents = ''.join(
+            char for char in normalized
+            if unicodedata.category(char) != 'Mn'
+        )
+
+        # Restore ñ, Ñ, ç, and Ç
+        without_accents = without_accents.replace('\u0001', 'ñ')
+        without_accents = without_accents.replace('\u0002', 'Ñ')
+        without_accents = without_accents.replace('\u0003', 'ç')
+        without_accents = without_accents.replace('\u0004', 'Ç')
+
+        return without_accents
+
     def _execute_search_query(
         self,
         query: str,
@@ -577,6 +623,9 @@ class CalibreDB:
         """
         Search for books by title matching a pattern.
 
+        This search is accent-insensitive, meaning it will match books
+        regardless of diacritical marks.
+
         Parameters
         ----------
         title_pattern : str
@@ -595,13 +644,56 @@ class CalibreDB:
             If there is a database error.
         """
         validated_pattern = validate_search_parameters(title_pattern)
+        normalized_pattern = self._normalize_text(validated_pattern)
 
-        query = 'SELECT id, title FROM books WHERE title LIKE ? ORDER BY title'
-        results = self._execute_search_query(
-            query,
-            (validated_pattern,),
-            'title search'
-        )
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Get all books and filter by normalized comparison
+                query = 'SELECT id, title FROM books ORDER BY title'
+                cursor.execute(query)
+                all_books = cursor.fetchall()
+
+                # Filter books by normalized title matching
+                results = []
+                # Remove % wildcards for pattern matching
+                search_pattern = normalized_pattern.replace('%', '')
+
+                for book in all_books:
+                    book_id, book_title = book
+                    normalized_title = self._normalize_text(book_title)
+
+                    # Handle different wildcard patterns
+                    starts_with_wildcard = validated_pattern.startswith('%')
+                    ends_with_wildcard = validated_pattern.endswith('%')
+
+                    if starts_with_wildcard and ends_with_wildcard:
+                        # Contains search: %pattern%
+                        if search_pattern.lower() in normalized_title.lower():
+                            results.append((book_id, book_title))
+                    elif starts_with_wildcard:
+                        # Ends with search: %pattern
+                        if normalized_title.lower().endswith(
+                            search_pattern.lower()
+                        ):
+                            results.append((book_id, book_title))
+                    elif ends_with_wildcard:
+                        # Starts with search: pattern%
+                        if normalized_title.lower().startswith(
+                            search_pattern.lower()
+                        ):
+                            results.append((book_id, book_title))
+                    else:
+                        # Exact match search
+                        if normalized_title.lower() == search_pattern.lower():
+                            results.append((book_id, book_title))
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'title search'
+            )
 
         if not results:
             raise NotFoundError(
@@ -616,6 +708,9 @@ class CalibreDB:
     ) -> List[Tuple[int, str]]:
         """
         Search for authors by name matching a pattern.
+
+        This search is accent-insensitive, meaning it will match authors
+        regardless of diacritical marks.
 
         Parameters
         ----------
@@ -635,13 +730,55 @@ class CalibreDB:
             If there is a database error.
         """
         validated_pattern = validate_search_parameters(name_pattern)
+        normalized_pattern = self._normalize_text(validated_pattern)
 
-        query = 'SELECT id, name FROM authors WHERE name LIKE ? ORDER BY name'
-        results = self._execute_search_query(
-            query,
-            (validated_pattern,),
-            'author name search'
-        )
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Get all authors and filter by normalized comparison
+                query = 'SELECT id, name FROM authors ORDER BY name'
+                cursor.execute(query)
+                all_authors = cursor.fetchall()
+
+                # Filter authors by normalized name matching
+                results = []
+                search_pattern = normalized_pattern.replace('%', '')
+
+                for author in all_authors:
+                    author_id, author_name = author
+                    normalized_name = self._normalize_text(author_name)
+
+                    # Handle different wildcard patterns
+                    starts_with_wildcard = validated_pattern.startswith('%')
+                    ends_with_wildcard = validated_pattern.endswith('%')
+
+                    if starts_with_wildcard and ends_with_wildcard:
+                        # Contains search: %pattern%
+                        if search_pattern.lower() in normalized_name.lower():
+                            results.append((author_id, author_name))
+                    elif starts_with_wildcard:
+                        # Ends with search: %pattern
+                        if normalized_name.lower().endswith(
+                            search_pattern.lower()
+                        ):
+                            results.append((author_id, author_name))
+                    elif ends_with_wildcard:
+                        # Starts with search: pattern%
+                        if normalized_name.lower().startswith(
+                            search_pattern.lower()
+                        ):
+                            results.append((author_id, author_name))
+                    else:
+                        # Exact match search
+                        if normalized_name.lower() == search_pattern.lower():
+                            results.append((author_id, author_name))
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'author name search'
+            )
 
         if not results:
             raise NotFoundError(
@@ -656,6 +793,9 @@ class CalibreDB:
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about books with tags matching a pattern.
+
+        This search is accent-insensitive, meaning it will match tags
+        regardless of diacritical marks.
 
         Parameters
         ----------
@@ -676,26 +816,79 @@ class CalibreDB:
             If there is a database error.
         """
         validated_pattern = validate_search_parameters(tag_pattern, 100)
+        normalized_pattern = self._normalize_text(validated_pattern)
 
-        query = """
-            SELECT DISTINCT b.id, b.title,
-                   COALESCE(GROUP_CONCAT(a.name, ' & '), '') as authors,
-                   b.pubdate
-            FROM books b
-            JOIN books_tags_link btl ON b.id = btl.book
-            JOIN tags t ON btl.tag = t.id
-            LEFT JOIN books_authors_link bal ON b.id = bal.book
-            LEFT JOIN authors a ON bal.author = a.id
-            WHERE t.name LIKE ?
-            GROUP BY b.id, b.title, b.pubdate
-            ORDER BY b.title
-        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        results = self._execute_search_query(
-            query,
-            (validated_pattern,),
-            'tag pattern search'
-        )
+                # Get all tags and filter by normalized comparison
+                query = 'SELECT id, name FROM tags'
+                cursor.execute(query)
+                all_tags = cursor.fetchall()
+
+                # Filter tags by normalized name matching
+                matching_tag_ids = []
+                search_pattern = normalized_pattern.replace('%', '')
+
+                for tag_id, tag_name_db in all_tags:
+                    normalized_tag = self._normalize_text(tag_name_db)
+
+                    # Handle different wildcard patterns
+                    starts_with_wildcard = validated_pattern.startswith('%')
+                    ends_with_wildcard = validated_pattern.endswith('%')
+
+                    if starts_with_wildcard and ends_with_wildcard:
+                        # Contains search: %pattern%
+                        if search_pattern.lower() in normalized_tag.lower():
+                            matching_tag_ids.append(tag_id)
+                    elif starts_with_wildcard:
+                        # Ends with search: %pattern
+                        if normalized_tag.lower().endswith(
+                            search_pattern.lower()
+                        ):
+                            matching_tag_ids.append(tag_id)
+                    elif ends_with_wildcard:
+                        # Starts with search: pattern%
+                        if normalized_tag.lower().startswith(
+                            search_pattern.lower()
+                        ):
+                            matching_tag_ids.append(tag_id)
+                    else:
+                        # Exact match search
+                        if normalized_tag.lower() == search_pattern.lower():
+                            matching_tag_ids.append(tag_id)
+
+                if not matching_tag_ids:
+                    raise NotFoundError(
+                        'books', validated_pattern, 'tag pattern'
+                    )
+
+                # Get books for matching tags
+                placeholders = ','.join('?' * len(matching_tag_ids))
+                query = f"""
+                    SELECT DISTINCT b.id, b.title,
+                           COALESCE(GROUP_CONCAT(a.name, ' & '), '')
+                           as authors,
+                           b.pubdate
+                    FROM books b
+                    JOIN books_tags_link btl ON b.id = btl.book
+                    JOIN tags t ON btl.tag = t.id
+                    LEFT JOIN books_authors_link bal ON b.id = bal.book
+                    LEFT JOIN authors a ON bal.author = a.id
+                    WHERE t.id IN ({placeholders})
+                    GROUP BY b.id, b.title, b.pubdate
+                    ORDER BY b.title
+                """
+
+                cursor.execute(query, matching_tag_ids)
+                results = cursor.fetchall()
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'tag pattern search'
+            )
 
         if not results:
             raise NotFoundError(
@@ -710,6 +903,9 @@ class CalibreDB:
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about all books by a specific author.
+
+        This search is accent-insensitive, meaning it will match authors
+        regardless of diacritical marks.
 
         Parameters
         ----------
@@ -730,28 +926,56 @@ class CalibreDB:
             If there is a database error.
         """
         validated_name = validate_search_parameters(author_name)
+        normalized_name = self._normalize_text(validated_name)
 
-        query = """
-            SELECT DISTINCT b.id, b.title, b.pubdate,
-                   CASE
-                       WHEN s.name IS NOT NULL
-                       THEN s.name || ' #' || CAST(b.series_index AS TEXT)
-                       ELSE ''
-                   END as series_info
-            FROM books b
-            JOIN books_authors_link bal ON b.id = bal.book
-            JOIN authors a ON bal.author = a.id
-            LEFT JOIN books_series_link bsl ON b.id = bsl.book
-            LEFT JOIN series s ON bsl.series = s.id
-            WHERE a.name = ?
-            ORDER BY b.pubdate DESC, b.title
-        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        results = self._execute_search_query(
-            query,
-            (validated_name,),
-            'author books search'
-        )
+                # Get all authors and find matching ones
+                query = 'SELECT id, name FROM authors'
+                cursor.execute(query)
+                all_authors = cursor.fetchall()
+
+                # Find authors matching the normalized name
+                matching_author_ids = []
+                for author_id, author_name_db in all_authors:
+                    if self._normalize_text(author_name_db).lower() == \
+                       normalized_name.lower():
+                        matching_author_ids.append(author_id)
+
+                if not matching_author_ids:
+                    raise NotFoundError(
+                        'books', validated_name, 'author name'
+                    )
+
+                # Get books for matching authors
+                placeholders = ','.join('?' * len(matching_author_ids))
+                query = f"""
+                    SELECT DISTINCT b.id, b.title, b.pubdate,
+                           CASE
+                               WHEN s.name IS NOT NULL
+                               THEN s.name || ' #' ||
+                                    CAST(b.series_index AS TEXT)
+                               ELSE ''
+                           END as series_info
+                    FROM books b
+                    JOIN books_authors_link bal ON b.id = bal.book
+                    JOIN authors a ON bal.author = a.id
+                    LEFT JOIN books_series_link bsl ON b.id = bsl.book
+                    LEFT JOIN series s ON bsl.series = s.id
+                    WHERE a.id IN ({placeholders})
+                    ORDER BY b.pubdate DESC, b.title
+                """
+
+                cursor.execute(query, matching_author_ids)
+                results = cursor.fetchall()
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'author books search'
+            )
 
         if not results:
             raise NotFoundError('books', validated_name, 'author name')
@@ -818,6 +1042,9 @@ class CalibreDB:
         """
         Get all books in a specific series.
 
+        This search is accent-insensitive, meaning it will match series
+        regardless of diacritical marks.
+
         Parameters
         ----------
         series_name : str
@@ -837,21 +1064,48 @@ class CalibreDB:
             If there is a database error.
         """
         validated_name = validate_search_parameters(series_name)
+        normalized_name = self._normalize_text(validated_name)
 
-        query = """
-            SELECT b.id, b.title, b.series_index
-            FROM books b
-            JOIN books_series_link bsl ON b.id = bsl.book
-            JOIN series s ON bsl.series = s.id
-            WHERE s.name = ?
-            ORDER BY b.series_index
-        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        results = self._execute_search_query(
-            query,
-            (validated_name,),
-            'series books search'
-        )
+                # Get all series and find matching ones
+                query = 'SELECT id, name FROM series'
+                cursor.execute(query)
+                all_series = cursor.fetchall()
+
+                # Find series matching the normalized name
+                matching_series_ids = []
+                for series_id, series_name_db in all_series:
+                    if self._normalize_text(series_name_db).lower() == \
+                       normalized_name.lower():
+                        matching_series_ids.append(series_id)
+
+                if not matching_series_ids:
+                    raise NotFoundError(
+                        'books', validated_name, 'series name'
+                    )
+
+                # Get books for matching series
+                placeholders = ','.join('?' * len(matching_series_ids))
+                query = f"""
+                    SELECT b.id, b.title, b.series_index
+                    FROM books b
+                    JOIN books_series_link bsl ON b.id = bsl.book
+                    JOIN series s ON bsl.series = s.id
+                    WHERE s.id IN ({placeholders})
+                    ORDER BY b.series_index
+                """
+
+                cursor.execute(query, matching_series_ids)
+                results = cursor.fetchall()
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'series books search'
+            )
 
         if not results:
             raise NotFoundError('books', validated_name, 'series name')
@@ -864,6 +1118,9 @@ class CalibreDB:
     ) -> List[Tuple[int, str, str, str]]:
         """
         Get detailed information about all books with a specific tag.
+
+        This search is accent-insensitive, meaning it will match tags
+        regardless of diacritical marks.
 
         Parameters
         ----------
@@ -884,26 +1141,52 @@ class CalibreDB:
             If there is a database error.
         """
         validated_name = validate_search_parameters(tag_name, 100)
+        normalized_name = self._normalize_text(validated_name)
 
-        query = """
-            SELECT DISTINCT b.id, b.title,
-                   COALESCE(GROUP_CONCAT(a.name, ' & '), '') as authors,
-                   b.pubdate
-            FROM books b
-            JOIN books_tags_link btl ON b.id = btl.book
-            JOIN tags t ON btl.tag = t.id
-            LEFT JOIN books_authors_link bal ON b.id = bal.book
-            LEFT JOIN authors a ON bal.author = a.id
-            WHERE t.name = ?
-            GROUP BY b.id, b.title, b.pubdate
-            ORDER BY b.title
-        """
+        try:
+            with database_connection(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        results = self._execute_search_query(
-            query,
-            (validated_name,),
-            'tag books search'
-        )
+                # Get all tags and find matching ones
+                query = 'SELECT id, name FROM tags'
+                cursor.execute(query)
+                all_tags = cursor.fetchall()
+
+                # Find tags matching the normalized name
+                matching_tag_ids = []
+                for tag_id, tag_name_db in all_tags:
+                    if self._normalize_text(tag_name_db).lower() == \
+                       normalized_name.lower():
+                        matching_tag_ids.append(tag_id)
+
+                if not matching_tag_ids:
+                    raise NotFoundError('books', validated_name, 'tag name')
+
+                # Get books for matching tags
+                placeholders = ','.join('?' * len(matching_tag_ids))
+                query = f"""
+                    SELECT DISTINCT b.id, b.title,
+                           COALESCE(GROUP_CONCAT(a.name, ' & '), '')
+                           as authors,
+                           b.pubdate
+                    FROM books b
+                    JOIN books_tags_link btl ON b.id = btl.book
+                    JOIN tags t ON btl.tag = t.id
+                    LEFT JOIN books_authors_link bal ON b.id = bal.book
+                    LEFT JOIN authors a ON bal.author = a.id
+                    WHERE t.id IN ({placeholders})
+                    GROUP BY b.id, b.title, b.pubdate
+                    ORDER BY b.title
+                """
+
+                cursor.execute(query, matching_tag_ids)
+                results = cursor.fetchall()
+
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f'Query execution failed: {e}',
+                'tag books search'
+            )
 
         if not results:
             raise NotFoundError('books', validated_name, 'tag name')
